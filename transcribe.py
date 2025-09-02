@@ -155,25 +155,46 @@ class AudioTranscriber:
                 ]
                 
                 logger.info(f"Создаю кусок {chunk_number}: {start_time/60:.1f}-{end_time/60:.1f} мин")
+                logger.debug(f"FFmpeg команда: {' '.join(cmd)}")
                 
                 result = subprocess.run(cmd, capture_output=True, text=True)
+                
                 if result.returncode == 0:
                     if chunk_file.exists() and chunk_file.stat().st_size > 0:
+                        chunk_size = chunk_file.stat().st_size / 1024 / 1024  # MB
+                        logger.info(f"Кусок {chunk_number} создан: {chunk_file.name} ({chunk_size:.2f} MB)")
                         chunk_files.append(chunk_file)
-                        logger.info(f"Кусок {chunk_number} создан: {chunk_file.name}")
                     else:
-                        logger.warning(f"Кусок {chunk_number} создан, но файл пуст")
+                        logger.warning(f"Кусок {chunk_number} создан, но файл пуст или не существует")
+                        logger.warning(f"FFmpeg stdout: {result.stdout}")
+                        logger.warning(f"FFmpeg stderr: {result.stderr}")
                 else:
-                    logger.error(f"Ошибка создания куска {chunk_number}: {result.stderr}")
+                    logger.error(f"Ошибка создания куска {chunk_number} (код возврата: {result.returncode})")
+                    logger.error(f"FFmpeg stdout: {result.stdout}")
+                    logger.error(f"FFmpeg stderr: {result.stderr}")
                 
                 start_time = end_time
                 chunk_number += 1
             
+            if not chunk_files:
+                logger.error(f"Не удалось создать ни одного куска из файла {file_path}")
+                return []
+            
             logger.info(f"Файл разделен на {len(chunk_files)} кусков")
-            return chunk_files
+            
+            # Проверяем все созданные куски
+            valid_chunks = []
+            for chunk_file in chunk_files:
+                if chunk_file.exists() and chunk_file.stat().st_size > 0:
+                    valid_chunks.append(chunk_file)
+                else:
+                    logger.warning(f"Кусок {chunk_file} недействителен")
+            
+            logger.info(f"Валидных кусков: {len(valid_chunks)} из {len(chunk_files)}")
+            return valid_chunks
             
         except Exception as e:
-            logger.error(f"Ошибка разделения файла {file_path}: {e}")
+            logger.error(f"Критическая ошибка разделения файла {file_path}: {e}")
             return []
 
     def transcribe_with_summary_approach(self, file_path: Path) -> Optional[str]:
@@ -432,19 +453,39 @@ class AudioTranscriber:
         try:
             logger.info(f"Транскрибирую кусок {chunk_number}/{total_chunks}: {chunk_path.name}")
             
-            # Загрузка куска
-            audio_file = genai.upload_file(path=str(chunk_path))
+            # Проверяем существование и размер файла куска
+            if not chunk_path.exists():
+                raise Exception(f"Файл куска {chunk_number} не существует: {chunk_path}")
             
-            # Ожидание обработки файла
+            chunk_size = chunk_path.stat().st_size
+            logger.info(f"Размер куска {chunk_number}: {chunk_size / 1024 / 1024:.2f} MB")
+            
+            if chunk_size == 0:
+                raise Exception(f"Файл куска {chunk_number} пустой")
+            
+            # Загрузка куска
+            logger.info(f"Загружаем кусок {chunk_number} в Gemini...")
+            audio_file = genai.upload_file(path=str(chunk_path))
+            logger.info(f"Файл куска {chunk_number} загружен с ID: {audio_file.name}")
+            
+            # Ожидание обработки файла с таймаутом
+            processing_time = 0
+            max_processing_time = 300  # 5 минут максимум
+            
             while audio_file.state.name == "PROCESSING":
-                logger.info(f"Обработка куска {chunk_number} в процессе...")
-                time.sleep(2)
+                logger.info(f"Обработка куска {chunk_number} в процессе... ({processing_time}с)")
+                time.sleep(5)
+                processing_time += 5
+                
+                if processing_time > max_processing_time:
+                    raise Exception(f"Превышено время ожидания обработки куска {chunk_number}")
+                
                 audio_file = genai.get_file(audio_file.name)
             
             if audio_file.state.name == "FAILED":
-                raise Exception(f"Не удалось обработать кусок {chunk_number}")
+                raise Exception(f"Gemini не смог обработать кусок {chunk_number}. Возможно, файл поврежден или в неподдерживаемом формате")
             
-            logger.info(f"Кусок {chunk_number} успешно загружен в Gemini")
+            logger.info(f"Кусок {chunk_number} успешно загружен в Gemini, статус: {audio_file.state.name}")
             
             # Получение образца голоса
             has_reference = self.find_and_load_reference_audio()
@@ -472,42 +513,76 @@ class AudioTranscriber:
             
             logger.info(f"Отправляем запрос на транскрипцию куска {chunk_number}...")
             
-            # Отправка запроса на транскрипцию
-            response = self.model.generate_content(
-                content,
-                generation_config=generation_config,
-                safety_settings={
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                }
-            )
+            # Отправка запроса на транскрипцию с повторными попытками
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    response = self.model.generate_content(
+                        content,
+                        generation_config=generation_config,
+                        safety_settings={
+                            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                        }
+                    )
+                    break
+                except Exception as e:
+                    if attempt < max_retries:
+                        logger.warning(f"Попытка {attempt + 1} для куска {chunk_number} не удалась: {e}. Повторяем через 10 секунд...")
+                        time.sleep(10)
+                    else:
+                        raise Exception(f"Все попытки транскрипции куска {chunk_number} исчерпаны. Последняя ошибка: {e}")
             
             # Удаление временного файла куска из Gemini
             genai.delete_file(audio_file.name)
+            logger.info(f"Файл куска {chunk_number} удален из Gemini")
             
-            # Обработка ответа
-            if response.candidates and len(response.candidates) > 0:
-                candidate = response.candidates[0]
-                
-                if candidate.content and candidate.content.parts:
-                    text_parts = []
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_parts.append(part.text)
-                    
-                    if text_parts:
-                        full_text = '\n'.join(text_parts)
-                        logger.info(f"Кусок {chunk_number} успешно транскрибирован: {len(full_text)} символов")
-                        return full_text.strip()
-                
-                raise Exception(f"Нет текстового содержимого в ответе для куска {chunk_number}")
-            else:
+            # Детальная обработка ответа
+            if not response.candidates:
                 raise Exception(f"Нет кандидатов в ответе для куска {chunk_number}")
+            
+            if len(response.candidates) == 0:
+                raise Exception(f"Пустой список кандидатов для куска {chunk_number}")
+            
+            candidate = response.candidates[0]
+            
+            # Проверяем причину блокировки
+            if hasattr(candidate, 'finish_reason'):
+                logger.info(f"Причина завершения для куска {chunk_number}: {candidate.finish_reason}")
+                if candidate.finish_reason.name in ['SAFETY', 'RECITATION']:
+                    raise Exception(f"Ответ заблокирован системой безопасности для куска {chunk_number}: {candidate.finish_reason}")
+            
+            if not candidate.content:
+                raise Exception(f"Нет содержимого в кандидате для куска {chunk_number}")
+            
+            if not candidate.content.parts:
+                raise Exception(f"Нет частей в содержимом для куска {chunk_number}")
+            
+            text_parts = []
+            for part in candidate.content.parts:
+                if hasattr(part, 'text') and part.text:
+                    text_parts.append(part.text)
+            
+            if not text_parts:
+                raise Exception(f"Нет текстовых частей в ответе для куска {chunk_number}")
+            
+            full_text = '\n'.join(text_parts)
+            logger.info(f"Кусок {chunk_number} успешно транскрибирован: {len(full_text)} символов")
+            return full_text.strip()
                 
         except Exception as e:
-            logger.error(f"Ошибка транскрипции куска {chunk_number}: {e}")
+            logger.error(f"ДЕТАЛЬНАЯ ОШИБКА транскрипции куска {chunk_number}: {e}")
+            # Сохраняем детали ошибки для отладки
+            error_details = {
+                'chunk_number': chunk_number,
+                'chunk_path': str(chunk_path),
+                'error': str(e),
+                'chunk_exists': chunk_path.exists() if chunk_path else False,
+                'chunk_size': chunk_path.stat().st_size if chunk_path and chunk_path.exists() else 0
+            }
+            self.failed_files[f"chunk_{chunk_number}_{original_filename}"] = error_details
             return None
 
     def transcribe_audio(self, file_path: Path) -> Optional[str]:
@@ -717,6 +792,7 @@ class AudioTranscriber:
 Метод: Разделение на куски по 15 минут
 Всего кусков: {total_chunks}
 Успешно обработано: {successful_chunks}
+Неудачных попыток: {total_chunks - successful_chunks}
 Дата: {time.strftime('%Y-%m-%d %H:%M:%S')}
 
 {"="*60}
@@ -725,11 +801,28 @@ class AudioTranscriber:
         
         combined = header
         for i, transcription in enumerate(transcriptions, 1):
-            combined += f"\n--- КУСОК {i} ---\n\n"
-            combined += transcription
+            combined += f"\n--- КУСОК {i} из {total_chunks} ---\n\n"
+            
+            # Проверяем, является ли это ошибкой
+            if transcription.startswith("[ОШИБКА:"):
+                combined += transcription
+                combined += f"\n\nПодробности ошибки смотри в логах и failed_files.json\n"
+            else:
+                combined += transcription
+            
             combined += f"\n\n{'='*40}\n"
         
-        combined += f"\n(КОНЕЦ ПОЛНОЙ ТРАНСКРИПЦИИ ФАЙЛА {filename})"
+        # Добавляем статистику в конец
+        if successful_chunks < total_chunks:
+            combined += f"\n\nВНИМАНИЕ: {total_chunks - successful_chunks} кусков не удалось обработать.\n"
+            combined += "Проверьте логи для выяснения причин ошибок.\n"
+            combined += "Возможные причины:\n"
+            combined += "- Повреждение аудиофайла\n"
+            combined += "- Превышение лимитов API\n"
+            combined += "- Сетевые проблемы\n"
+            combined += "- Ошибки при разделении файла\n\n"
+        
+        combined += f"(КОНЕЦ ПОЛНОЙ ТРАНСКРИПЦИИ ФАЙЛА {filename})"
         
         return combined
 
