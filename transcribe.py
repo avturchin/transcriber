@@ -212,14 +212,27 @@ check names correctedness"""
 муж Евгений лизы
 Мура дочь лизы
 
+ВАЖНО: Сделай транскрипцию максимально компактной, но полной. Если файл длинный, разбей на логические части.
+
 Верни только транскрипцию в указанном формате, без дополнительных комментариев.
 """
         return base_prompt
 
+    def get_audio_duration_estimate(self, file_path: Path) -> int:
+        """Оценивает длительность аудио файла на основе размера"""
+        # Приблизительная оценка: 1MB ≈ 1 минута для сжатого аудио
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        estimated_minutes = max(1, int(size_mb))
+        return estimated_minutes
+
     def transcribe_audio(self, file_path: Path) -> Optional[str]:
         """Транскрибирует один аудио файл"""
         try:
-            logger.info(f"Транскрибирую файл: {file_path} (размер: {file_path.stat().st_size / (1024*1024):.2f} MB)")
+            file_size_mb = file_path.stat().st_size / (1024 * 1024)
+            estimated_duration = self.get_audio_duration_estimate(file_path)
+            
+            logger.info(f"Транскрибирую файл: {file_path}")
+            logger.info(f"Размер: {file_size_mb:.2f} MB, оценочная длительность: {estimated_duration} мин")
             
             # Загрузка основного аудио файла
             audio_file = genai.upload_file(path=str(file_path))
@@ -227,7 +240,7 @@ check names correctedness"""
             # Ожидание обработки файла
             while audio_file.state.name == "PROCESSING":
                 logger.info("Обработка файла в процессе...")
-                time.sleep(2)
+                time.sleep(3)
                 audio_file = genai.get_file(audio_file.name)
             
             if audio_file.state.name == "FAILED":
@@ -247,16 +260,19 @@ check names correctedness"""
                 content.append(self.reference_audio_file)
                 logger.info("Используется образец голоса для улучшения распознавания")
             
+            # Динамическое определение max_output_tokens на основе длительности
+            estimated_tokens = min(8000, max(2000, estimated_duration * 100))
+            
             # Настройки генерации для лучшей обработки длинных файлов
             generation_config = genai.types.GenerationConfig(
                 temperature=0.1,  # Низкая температура для точности
                 top_p=0.8,
                 top_k=40,
-                max_output_tokens=8192,  # Максимальная длина ответа
+                max_output_tokens=estimated_tokens,
                 response_mime_type="text/plain",
             )
             
-            logger.info("Отправляем запрос на транскрипцию...")
+            logger.info(f"Отправляем запрос на транскрипцию с max_output_tokens={estimated_tokens}...")
             
             # Отправка запроса на транскрипцию
             response = self.model.generate_content(
@@ -273,12 +289,38 @@ check names correctedness"""
             # Удаление временного файла основного аудио
             genai.delete_file(audio_file.name)
             
-            if response.text:
-                logger.info(f"Успешно транскрибирован файл: {file_path}")
-                logger.info(f"Длина транскрипции: {len(response.text)} символов")
-                return response.text.strip()
+            # Обработка ответа
+            if response.candidates and len(response.candidates) > 0:
+                candidate = response.candidates[0]
+                
+                # Проверка причины завершения
+                if candidate.finish_reason:
+                    finish_reason_name = candidate.finish_reason.name if hasattr(candidate.finish_reason, 'name') else str(candidate.finish_reason)
+                    logger.info(f"Причина завершения: {finish_reason_name}")
+                    
+                    if candidate.finish_reason.name == "MAX_TOKENS":
+                        logger.warning(f"Достигнут лимит токенов для файла {file_path.name}")
+                        logger.info("Попытка повторной обработки с увеличенным лимитом...")
+                        
+                        # Повторная попытка с увеличенным лимитом
+                        return self.transcribe_with_increased_tokens(file_path, estimated_tokens * 2)
+                
+                # Извлечение текста
+                if candidate.content and candidate.content.parts:
+                    text_parts = []
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            text_parts.append(part.text)
+                    
+                    if text_parts:
+                        full_text = '\n'.join(text_parts)
+                        logger.info(f"Успешно транскрибирован файл: {file_path}")
+                        logger.info(f"Длина транскрипции: {len(full_text)} символов")
+                        return full_text.strip()
+                
+                raise Exception("Нет текстового содержимого в ответе")
             else:
-                raise Exception("Пустой ответ от API")
+                raise Exception("Нет кандидатов в ответе")
                 
         except Exception as e:
             logger.error(f"Ошибка транскрипции файла {file_path}: {e}")
@@ -289,6 +331,77 @@ check names correctedness"""
                     genai.delete_file(audio_file.name)
             except:
                 pass
+            return None
+
+    def transcribe_with_increased_tokens(self, file_path: Path, max_tokens: int) -> Optional[str]:
+        """Повторная транскрипция с увеличенным лимитом токенов"""
+        try:
+            logger.info(f"Повторная попытка с max_output_tokens={max_tokens}")
+            
+            # Загрузка файла заново
+            audio_file = genai.upload_file(path=str(file_path))
+            
+            while audio_file.state.name == "PROCESSING":
+                time.sleep(2)
+                audio_file = genai.get_file(audio_file.name)
+            
+            if audio_file.state.name == "FAILED":
+                raise Exception("Не удалось обработать аудио файл при повторной попытке")
+            
+            # Упрощенный промпт для длинных файлов
+            simple_prompt = f"""
+Сделай дословную транскрипцию аудио файла {file_path.name}. 
+
+Формат:
+[HH:MM:SS] (Имя): текст
+
+Идентифицируй говорящих как: Алексей, Лиза, Евгений, Мура.
+
+Добавляй summary каждые 10 минут.
+
+В конце напиши: (конец файла)
+"""
+            
+            content = [simple_prompt, audio_file]
+            if self.reference_audio_file:
+                content.append(self.reference_audio_file)
+            
+            generation_config = genai.types.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=min(max_tokens, 8000),  # Ограничиваем максимумом
+                response_mime_type="text/plain",
+            )
+            
+            response = self.model.generate_content(
+                content,
+                generation_config=generation_config,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
+            )
+            
+            genai.delete_file(audio_file.name)
+            
+            if response.candidates and len(response.candidates) > 0:
+                candidate = response.candidates[0]
+                if candidate.content and candidate.content.parts:
+                    text_parts = []
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            text_parts.append(part.text)
+                    
+                    if text_parts:
+                        full_text = '\n'.join(text_parts)
+                        logger.info(f"Успешна повторная транскрипция файла: {file_path}")
+                        return full_text.strip()
+            
+            raise Exception("Повторная попытка не дала результата")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при повторной транскрипции {file_path}: {e}")
             return None
 
     def save_transcription(self, file_path: Path, transcription: str):
@@ -395,8 +508,8 @@ check names correctedness"""
                         
                         logger.info(f"Файл {file_path.name} успешно обработан")
                     
-                    # Задержка между запросами (увеличена для Gemini 2.5 Pro)
-                    if i < len(audio_files):  # Не ждать после последнего файла
+                    # Задержка между запросами
+                    if i < len(audio_files):
                         logger.info(f"Ожидание {self.delay} секунд перед следующим файлом...")
                         time.sleep(self.delay)
                     
@@ -429,7 +542,7 @@ def main():
     # Настройки из переменных окружения или значения по умолчанию
     source_dir = os.getenv('SOURCE_DIR', 'audio_files')
     output_dir = os.getenv('OUTPUT_DIR', 'transcriptions')
-    delay = float(os.getenv('API_DELAY', '3.0'))  # Увеличена для Pro версии
+    delay = float(os.getenv('API_DELAY', '4.0'))  # Увеличена задержка
     use_reference = os.getenv('USE_REFERENCE_AUDIO', 'true').lower() in ('true', '1', 'yes')
     
     # Создание и запуск транскрайбера
