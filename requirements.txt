@@ -1,1 +1,2 @@
-
+google-generativeai>=0.3.0
+pathlib2>=2.3.6
