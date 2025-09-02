@@ -723,7 +723,7 @@ def main():
     transcriber.run()
 
 if __name__ == "__main__":
-    main()роса
+    main()
             content = [prompt, audio_file]
             if has_reference and self.reference_audio_file:
                 content.append(self.reference_audio_file)
