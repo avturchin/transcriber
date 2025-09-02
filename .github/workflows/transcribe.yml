@@ -1,7 +1,21 @@
-name: Audio Transcription
+name: Audio Transcription with Gemini 2.5 Pro
 
 on:
   workflow_dispatch:  # Ручной запуск
+    inputs:
+      use_reference_audio:
+        description: 'Использовать образец голоса Алексея'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
+      api_delay:
+        description: 'Задержка между запросами (секунды)'
+        required: false
+        default: '3.0'
+        type: string
   push:
     paths:
       - 'audio_files/**'  # Запуск при добавлении файлов в папку audio_files
@@ -9,6 +23,7 @@ on:
 jobs:
   transcribe:
     runs-on: ubuntu-latest
+    timeout-minutes: 480  # 8 часов максимум
     
     steps:
     - name: Checkout repository
@@ -31,7 +46,8 @@ jobs:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         SOURCE_DIR: 'audio_files'
         OUTPUT_DIR: 'transcriptions'
-        API_DELAY: '2.0'
+        API_DELAY: ${{ github.event.inputs.api_delay || '3.0' }}
+        USE_REFERENCE_AUDIO: ${{ github.event.inputs.use_reference_audio || 'true' }}
       run: |
         python transcribe.py
     
@@ -40,5 +56,5 @@ jobs:
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git add transcriptions/ audio_files/
-        git diff --staged --quiet || git commit -m "Add transcriptions and rename processed files"
+        git diff --staged --quiet || git commit -m "Add transcriptions (Gemini 2.5 Pro) and rename processed files"
         git push
