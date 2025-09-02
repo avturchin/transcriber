@@ -1,0 +1,3 @@
+{
+  "audio_files/Voice Memo - 2016-02-17 17 20 17 - С Лизой В Самолете.m4a": "Invalid operation: The `response.text` quick accessor requires the response to contain a valid `Part`, but none were returned. The candidate's [finish_reason](https://ai.google.dev/api/generate-content#finishreason) is 2."
+}
