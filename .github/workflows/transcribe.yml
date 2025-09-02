@@ -1,7 +1,7 @@
 name: Audio Transcription with Gemini 2.5 Pro
 
 on:
-  workflow_dispatch:  # Ручной запуск
+  workflow_dispatch:  # Только ручной запуск
     inputs:
       use_reference_audio:
         description: 'Использовать образец голоса Алексея'
@@ -16,9 +16,6 @@ on:
         required: false
         default: '3.0'
         type: string
-  push:
-    paths:
-      - 'audio_files/**'  # Запуск при добавлении файлов в папку audio_files
 
 jobs:
   transcribe:
@@ -30,6 +27,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
+        lfs: true  # Включаем поддержку LFS
     
     - name: Set up Python
       uses: actions/setup-python@v4
