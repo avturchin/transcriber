@@ -32,6 +32,7 @@ class AudioTranscriber:
         self.max_file_size = 2 * 1024 * 1024 * 1024  # 2GB лимит для Gemini 2.5 Pro
         self.supported_formats = {'.mp3', '.wav', '.m4a', '.flac', '.ogg', '.webm', '.aac'}
         self.chunk_duration = 15 * 60  # 15 минут в секундах
+        self.ffmpeg_available = False
         
         # Настройка Gemini API - используем Gemini 2.5 Pro
         genai.configure(api_key=api_key)
@@ -50,6 +51,9 @@ class AudioTranscriber:
         self.temp_dir = self.output_dir / "temp"
         self.temp_dir.mkdir(exist_ok=True)
         
+        # Проверяем наличие ffmpeg
+        self.ffmpeg_available = self.check_ffmpeg()
+        
         # Файл для отслеживания обработанных файлов
         self.processed_files_log = self.output_dir / "processed_files.json"
         self.processed_files = self.load_processed_files()
@@ -63,34 +67,44 @@ class AudioTranscriber:
         self.reference_loaded = False
 
     def check_ffmpeg(self):
-        """Проверяет наличие ffmpeg"""
+        """Проверяет наличие ffmpeg и ffprobe"""
         try:
+            # Проверяем ffmpeg
             result = subprocess.run(['ffmpeg', '-version'], 
                                   capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info("FFmpeg найден и готов к использованию")
-                return True
+            if result.returncode != 0:
+                raise FileNotFoundError("ffmpeg не работает")
+            
+            # Проверяем ffprobe
+            result = subprocess.run(['ffprobe', '-version'], 
+                                  capture_output=True, text=True)
+            if result.returncode != 0:
+                raise FileNotFoundError("ffprobe не работает")
+                
+            logger.info("FFmpeg и FFprobe найдены и готовы к использованию")
+            return True
+            
         except FileNotFoundError:
-            pass
-        
-        logger.warning("FFmpeg не найден. Для разделения длинных файлов требуется ffmpeg")
-        logger.info("Установите ffmpeg: https://ffmpeg.org/download.html")
-        return False
+            logger.warning("FFmpeg/FFprobe не найдены")
+            logger.info("Для разделения длинных файлов на куски потребуется ffmpeg")
+            logger.info("Будет использована альтернативная стратегия для длинных файлов")
+            return False
 
     def get_audio_duration(self, file_path: Path) -> Optional[float]:
         """Получает точную длительность аудио файла с помощью ffprobe"""
-        try:
-            cmd = [
-                'ffprobe', '-v', 'quiet', '-show_entries', 
-                'format=duration', '-of', 'csv=p=0', str(file_path)
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                duration = float(result.stdout.strip())
-                logger.info(f"Длительность файла {file_path.name}: {duration/60:.1f} минут")
-                return duration
-        except Exception as e:
-            logger.warning(f"Не удалось получить длительность {file_path}: {e}")
+        if self.ffmpeg_available:
+            try:
+                cmd = [
+                    'ffprobe', '-v', 'quiet', '-show_entries', 
+                    'format=duration', '-of', 'csv=p=0', str(file_path)
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    duration = float(result.stdout.strip())
+                    logger.info(f"Точная длительность файла {file_path.name}: {duration/60:.1f} минут")
+                    return duration
+            except Exception as e:
+                logger.warning(f"Не удалось получить длительность {file_path}: {e}")
         
         # Fallback на оценку по размеру
         size_mb = file_path.stat().st_size / (1024 * 1024)
@@ -100,6 +114,10 @@ class AudioTranscriber:
 
     def split_audio_file(self, file_path: Path) -> List[Path]:
         """Разделяет аудио файл на куски по 15 минут"""
+        if not self.ffmpeg_available:
+            logger.warning("FFmpeg недоступен, не могу разделить файл на куски")
+            return []
+            
         try:
             duration = self.get_audio_duration(file_path)
             if not duration:
@@ -109,10 +127,6 @@ class AudioTranscriber:
             if duration <= self.chunk_duration:
                 logger.info(f"Файл {file_path.name} короче 15 минут, разделение не требуется")
                 return [file_path]
-            
-            if not self.check_ffmpeg():
-                logger.error("FFmpeg недоступен, не могу разделить файл")
-                return []
             
             logger.info(f"Разделяю файл {file_path.name} на куски по 15 минут...")
             
@@ -161,6 +175,98 @@ class AudioTranscriber:
         except Exception as e:
             logger.error(f"Ошибка разделения файла {file_path}: {e}")
             return []
+
+    def transcribe_with_summary_approach(self, file_path: Path) -> Optional[str]:
+        """Альтернативная стратегия: краткая транскрипция основных моментов"""
+        try:
+            logger.info(f"Использую summary-подход для длинного файла {file_path.name}")
+            
+            # Загрузка файла
+            audio_file = genai.upload_file(path=str(file_path))
+            
+            while audio_file.state.name == "PROCESSING":
+                time.sleep(2)
+                audio_file = genai.get_file(audio_file.name)
+            
+            if audio_file.state.name == "FAILED":
+                raise Exception("Не удалось обработать аудио файл")
+            
+            has_reference = self.find_and_load_reference_audio()
+            
+            # Промпт для краткой транскрипции
+            summary_prompt = f"""
+Пожалуйста, выполни структурированную транскрипцию основных моментов из длинного аудиофайла {file_path.name}.
+
+Поскольку файл длинный и ffmpeg недоступен для разделения, сосредоточься на:
+- Основных темах разговора
+- Ключевых высказываниях и решениях  
+- Важных фактах и информации
+- Эмоциональных моментах и интересных деталях
+
+Идентифицируй говорящих:
+- Алексей (друг Лизы)
+- Лиза  
+- Мура (дочь Лизы)
+
+Требования к формату:
+- Используй таймкоды: [ММ:СС] (Имя): краткое изложение основной мысли
+- Каждые 10 минут делай summary основных тем
+- Не пропускай важные детали и интересные факты
+- Обнаружение зацикливания: если фрагмент повторяется более 3 раз, отметь это
+
+Структура транскрипции:
+1. Начало разговора - основная тема
+2. Основные моменты по времени с таймкодами
+3. Ключевые выводы или решения
+4. Интересные факты и детали
+5. Завершение
+
+В начале укажи: "КРАТКАЯ ТРАНСКРИПЦИЯ - основные моменты длинного файла (ffmpeg недоступен)"
+
+В конце сделай выжимку: какие самые интересные факты мы узнали из разговора.
+
+Затем добавь: "(Примечание: сокращенная версия, полная транскрипция требует установки ffmpeg для разделения файла на куски)"
+"""
+
+            content = [summary_prompt, audio_file]
+            if has_reference and self.reference_audio_file:
+                content.append(self.reference_audio_file)
+            
+            generation_config = genai.types.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=6000,
+                response_mime_type="text/plain",
+            )
+            
+            response = self.model.generate_content(
+                content,
+                generation_config=generation_config,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
+            )
+            
+            genai.delete_file(audio_file.name)
+            
+            if response.candidates and response.candidates[0].content:
+                text_parts = []
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        text_parts.append(part.text)
+                
+                if text_parts:
+                    result = '\n'.join(text_parts)
+                    logger.info(f"Summary транскрипция завершена: {len(result)} символов")
+                    return result
+            
+            raise Exception("Нет результата в summary транскрипции")
+                
+        except Exception as e:
+            logger.error(f"Ошибка summary транскрипции {file_path}: {e}")
+            return None
 
     def load_processed_files(self) -> set:
         """Загружает список уже обработанных файлов"""
@@ -282,20 +388,32 @@ class AudioTranscriber:
                            start_time_minutes: int, has_reference: bool) -> str:
         """Создает промпт для транскрипции куска"""
         prompt = f"""
-Транскрибируй кусок {chunk_number} из {total_chunks} аудиофайла "{filename}".
+Пожалуйста, выполни дословную транскрипцию речи на русском из куска {chunk_number} из {total_chunks} аудиофайла "{filename}".
 
-Время начала куска: {start_time_minutes} минут от начала файла.
+ВАЖНО: Время начала куска: {start_time_minutes} минут от начала всего файла.
 
-Требования:
-1. Точная дословная транскрипция всех слов
-2. Идентификация говорящих: Алексей, Лиза, Евгений, Мура
-3. Формат: [ММ:СС] (Имя): текст
-4. Таймкоды относительно НАЧАЛА ВСЕГО ФАЙЛА (не куска!)
-5. Если кусок начинается с середины фразы, отметь это
+Основные требования:
+- Распознай и запиши в текстовом виде абсолютно все произнесенные слова, не пропуская, не суммируя и не обобщая содержание
+- Запиши точно все, что было сказано, и только это
+- Если кусок начинается с середины фразы, отметь это как "...продолжение фразы с предыдущего куска..."
+- Добавь таймкоды к каждой реплике (ОТНОСИТЕЛЬНО НАЧАЛА ВСЕГО ФАЙЛА, не куска!)
+- Если никто ничего не говорит, просто пропускай этот таймкод
+- Продолжай до конца куска, не повторяйся
 
-Пример формата:
+Идентифицируй говорящих и указывай их имена в транскрипте:
+- Алексей (друг Лизы) 
+- Лиза
+- Мура (дочь Лизы)
+
+Обнаружение зацикливания:
+1. Анализируй текст на предмет дословных повторов
+2. Если последовательность из более чем 15 слов повторяется более 3 раз подряд, считай это техническим сбоем
+3. Транскрибируй повторяющийся фрагмент только один раз
+4. Вместо повторов вставь: [Обнаружен и пропущен многократно повторяющийся фрагмент]
+
+Пример формата для этого куска (таймкоды от начала ВСЕГО файла):
 [{start_time_minutes:02d}:15] (Алексей): ...продолжение фразы с предыдущего куска...
-[{start_time_minutes:02d}:45] (Лиза): Да, я согласна с тобой.
+[{start_time_minutes:02d}:20] (Лиза): Да, я согласна с тобой по этому вопросу.
 
 В конце куска напиши:
 (конец куска {chunk_number}/{total_chunks})
@@ -304,7 +422,7 @@ class AudioTranscriber:
 (фраза продолжается в следующем куске)"""
 
         if has_reference:
-            prompt += "\n\nИспользуй прикрепленный образец голоса Алексея для точной идентификации."
+            prompt += "\n\nИспользуй прикрепленный образец голоса Алексея Турчина для правильного проставления его имени."
         
         return prompt
 
@@ -341,170 +459,6 @@ class AudioTranscriber:
             content = [prompt, audio_file]
             if has_reference and self.reference_audio_file:
                 content.append(self.reference_audio_file)
-                logger.info(f"Используется образец голоса для куска {chunk_number}")
-            
-            # Настройки генерации
-            generation_config = genai.types.GenerationConfig(
-                temperature=0.1,
-                top_p=0.8,
-                top_k=40,
-                max_output_tokens=6000,
-                response_mime_type="text/plain",
-            )
-            
-            logger.info(f"Отправляем запрос на транскрипцию куска {chunk_number}...")
-            
-            # Отправка запроса на транскрипцию
-            response = self.model.generate_content(
-                content,
-                generation_config=generation_config,
-                safety_settings={
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                }
-            )
-            
-            # Удаление временного файла куска из Gemini
-            genai.delete_file(audio_file.name)
-            
-            # Обработка ответа
-            if response.candidates and len(response.candidates) > 0:
-                candidate = response.candidates[0]
-                
-                if candidate.content and candidate.content.parts:
-                    text_parts = []
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_parts.append(part.text)
-                    
-                    if text_parts:
-                        full_text = '\n'.join(text_parts)
-                        logger.info(f"Кусок {chunk_number} успешно транскрибирован: {len(full_text)} символов")
-                        return full_text.strip()
-                
-                raise Exception(f"Нет текстового содержимого в ответе для куска {chunk_number}")
-            else:
-                raise Exception(f"Нет кандидатов в ответе для куска {chunk_number}")
-                
-        except Exception as e:
-            logger.error(f"Ошибка транскрипции куска {chunk_number}: {e}")
-            return None
-
-    def transcribe_audio(self, file_path: Path) -> Optional[str]:
-        """Транскрибирует аудио файл, разделяя на куски при необходимости"""
-        try:
-            logger.info(f"Начинаю обработку файла: {file_path}")
-            
-            # Получаем длительность файла
-            duration = self.get_audio_duration(file_path)
-            if not duration:
-                logger.error(f"Не удалось определить длительность файла {file_path}")
-                return None
-            
-            duration_minutes = duration / 60
-            
-            # Если файл короткий, обрабатываем как обычно
-            if duration <= self.chunk_duration:
-                logger.info(f"Файл короткий ({duration_minutes:.1f} мин), стандартная обработка")
-                return self.transcribe_single_file(file_path)
-            
-            # Длинный файл - разделяем на куски
-            logger.info(f"Файл длинный ({duration_minutes:.1f} мин), разделяем на куски")
-            chunk_files = self.split_audio_file(file_path)
-            
-            if not chunk_files:
-                logger.error(f"Не удалось разделить файл {file_path}")
-                return None
-            
-            # Транскрибируем каждый кусок
-            all_transcriptions = []
-            successful_chunks = 0
-            
-            for i, chunk_path in enumerate(chunk_files, 1):
-                start_time_minutes = (i - 1) * 15  # Время начала куска в минутах
-                
-                transcription = self.transcribe_chunk(
-                    chunk_path, i, len(chunk_files), 
-                    start_time_minutes, file_path.name
-                )
-                
-                if transcription:
-                    all_transcriptions.append(transcription)
-                    successful_chunks += 1
-                    logger.info(f"Кусок {i}/{len(chunk_files)} успешно обработан")
-                else:
-                    logger.warning(f"Кусок {i}/{len(chunk_files)} не удалось транскрибировать")
-                    all_transcriptions.append(f"\n[ОШИБКА: Кусок {i} не удалось транскрибировать]\n")
-                
-                # Задержка между кусками
-                if i < len(chunk_files):
-                    logger.info(f"Пауза {self.delay} секунд перед следующим куском...")
-                    time.sleep(self.delay)
-            
-            # Очистка временных файлов
-            self.cleanup_chunks(chunk_files)
-            
-            if successful_chunks == 0:
-                logger.error(f"Ни один кусок файла {file_path} не удалось транскрибировать")
-                return None
-            
-            # Объединяем все транскрипции
-            final_transcription = self.combine_chunk_transcriptions(
-                all_transcriptions, file_path.name, len(chunk_files), successful_chunks
-            )
-            
-            logger.info(f"Файл {file_path.name} полностью обработан: {successful_chunks}/{len(chunk_files)} кусков")
-            return final_transcription
-            
-        except Exception as e:
-            logger.error(f"Ошибка обработки файла {file_path}: {e}")
-            return None
-
-    def transcribe_single_file(self, file_path: Path) -> Optional[str]:
-        """Транскрибирует одиночный файл без разделения"""
-        try:
-            # Загрузка файла
-            audio_file = genai.upload_file(path=str(file_path))
-            
-            # Ожидание обработки файла
-            while audio_file.state.name == "PROCESSING":
-                logger.info("Обработка файла в процессе...")
-                time.sleep(3)
-                audio_file = genai.get_file(audio_file.name)
-            
-            if audio_file.state.name == "FAILED":
-                raise Exception("Не удалось обработать аудио файл")
-            
-            logger.info("Файл успешно загружен в Gemini")
-            
-            # Получение образца голоса
-            has_reference = self.find_and_load_reference_audio()
-            
-            # Стандартный промпт
-            prompt = f"""
-Выполни дословную транскрипцию аудиофайла {file_path.name}.
-
-Требования:
-1. Идентифицируй говорящих: Алексей, Лиза, Евгений, Мура
-2. Формат: [ММ:СС] (Имя): текст
-3. Таймкоды каждые 30 секунд
-4. Summary каждые 5 минут
-5. Точная транскрипция всех слов
-6. В конце: (конец файла)
-
-Пример:
-[00:30] (Алексей): Привет, как дела?
-[01:00] (Лиза): Отлично, спасибо!"""
-
-            if has_reference:
-                prompt += "\n\nИспользуй прикрепленный образец голоса Алексея для точной идентификации."
-            
-            # Подготовка содержимого для запроса
-            content = [prompt, audio_file]
-            if has_reference and self.reference_audio_file:
-                content.append(self.reference_audio_file)
                 logger.info("Используется образец голоса для улучшения распознавания")
             
             # Настройки генерации
@@ -512,7 +466,7 @@ class AudioTranscriber:
                 temperature=0.1,
                 top_p=0.8,
                 top_k=40,
-                max_output_tokens=6000,
+                max_output_tokens=8000,
                 response_mime_type="text/plain",
             )
             
@@ -611,6 +565,7 @@ class AudioTranscriber:
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(f"Транскрипция файла: {file_path.name}\n")
                 f.write(f"Модель: {self.model.model_name}\n")
+                f.write(f"FFmpeg доступен: {'Да' if self.ffmpeg_available else 'Нет'}\n")
                 f.write(f"Дата создания: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 50 + "\n\n")
                 f.write(transcription)
@@ -635,6 +590,7 @@ class AudioTranscriber:
             with open(combined_file, 'w', encoding='utf-8') as f:
                 f.write("СВОДНАЯ ТРАНСКРИПЦИЯ ВСЕХ АУДИО ФАЙЛОВ\n")
                 f.write(f"Модель: {self.model.model_name}\n")
+                f.write(f"FFmpeg доступен: {'Да' if self.ffmpeg_available else 'Нет'}\n")
                 f.write(f"Дата создания: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 60 + "\n\n")
                 
@@ -680,11 +636,11 @@ class AudioTranscriber:
 
     def run(self):
         """Основной метод выполнения транскрипции"""
-        logger.info("Запуск процесса транскрипции с разделением длинных файлов")
+        logger.info("Запуск процесса транскрипции с адаптивной обработкой")
+        logger.info(f"FFmpeg доступен: {'Да' if self.ffmpeg_available else 'Нет'}")
         
-        # Проверяем наличие ffmpeg
-        if not self.check_ffmpeg():
-            logger.warning("FFmpeg не найден. Длинные файлы не смогут быть разделены.")
+        if not self.ffmpeg_available:
+            logger.info("Длинные файлы будут обработаны с помощью summary-подхода")
         
         try:
             # Поиск аудио файлов
@@ -767,4 +723,204 @@ def main():
     transcriber.run()
 
 if __name__ == "__main__":
-    main()
+    main()роса
+            content = [prompt, audio_file]
+            if has_reference and self.reference_audio_file:
+                content.append(self.reference_audio_file)
+                logger.info(f"Используется образец голоса для куска {chunk_number}")
+            
+            # Настройки генерации
+            generation_config = genai.types.GenerationConfig(
+                temperature=0.1,
+                top_p=0.8,
+                top_k=40,
+                max_output_tokens=6000,
+                response_mime_type="text/plain",
+            )
+            
+            logger.info(f"Отправляем запрос на транскрипцию куска {chunk_number}...")
+            
+            # Отправка запроса на транскрипцию
+            response = self.model.generate_content(
+                content,
+                generation_config=generation_config,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
+            )
+            
+            # Удаление временного файла куска из Gemini
+            genai.delete_file(audio_file.name)
+            
+            # Обработка ответа
+            if response.candidates and len(response.candidates) > 0:
+                candidate = response.candidates[0]
+                
+                if candidate.content and candidate.content.parts:
+                    text_parts = []
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            text_parts.append(part.text)
+                    
+                    if text_parts:
+                        full_text = '\n'.join(text_parts)
+                        logger.info(f"Кусок {chunk_number} успешно транскрибирован: {len(full_text)} символов")
+                        return full_text.strip()
+                
+                raise Exception(f"Нет текстового содержимого в ответе для куска {chunk_number}")
+            else:
+                raise Exception(f"Нет кандидатов в ответе для куска {chunk_number}")
+                
+        except Exception as e:
+            logger.error(f"Ошибка транскрипции куска {chunk_number}: {e}")
+            return None
+
+    def transcribe_audio(self, file_path: Path) -> Optional[str]:
+        """Транскрибирует аудио файл, выбирая оптимальную стратегию"""
+        try:
+            logger.info(f"Начинаю обработку файла: {file_path}")
+            
+            # Получаем длительность файла
+            duration = self.get_audio_duration(file_path)
+            if not duration:
+                logger.error(f"Не удалось определить длительность файла {file_path}")
+                return None
+            
+            duration_minutes = duration / 60
+            
+            # Стратегия обработки в зависимости от длительности и наличия ffmpeg
+            if duration <= self.chunk_duration:
+                logger.info(f"Файл короткий ({duration_minutes:.1f} мин), стандартная обработка")
+                return self.transcribe_single_file(file_path)
+            
+            elif self.ffmpeg_available:
+                logger.info(f"Файл длинный ({duration_minutes:.1f} мин), разделяем на куски")
+                return self.transcribe_with_chunks(file_path)
+            
+            else:
+                logger.info(f"Файл длинный ({duration_minutes:.1f} мин), но ffmpeg недоступен")
+                logger.info("Использую summary-подход для извлечения основных моментов")
+                return self.transcribe_with_summary_approach(file_path)
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки файла {file_path}: {e}")
+            return None
+
+    def transcribe_with_chunks(self, file_path: Path) -> Optional[str]:
+        """Транскрибирует файл, разделяя на куски"""
+        try:
+            # Разделяем файл на куски
+            chunk_files = self.split_audio_file(file_path)
+            
+            if not chunk_files:
+                logger.error(f"Не удалось разделить файл {file_path}")
+                # Fallback на summary подход
+                logger.info("Переключаемся на summary-подход")
+                return self.transcribe_with_summary_approach(file_path)
+            
+            # Транскрибируем каждый кусок
+            all_transcriptions = []
+            successful_chunks = 0
+            
+            for i, chunk_path in enumerate(chunk_files, 1):
+                start_time_minutes = (i - 1) * 15  # Время начала куска в минутах
+                
+                transcription = self.transcribe_chunk(
+                    chunk_path, i, len(chunk_files), 
+                    start_time_minutes, file_path.name
+                )
+                
+                if transcription:
+                    all_transcriptions.append(transcription)
+                    successful_chunks += 1
+                    logger.info(f"Кусок {i}/{len(chunk_files)} успешно обработан")
+                else:
+                    logger.warning(f"Кусок {i}/{len(chunk_files)} не удалось транскрибировать")
+                    all_transcriptions.append(f"\n[ОШИБКА: Кусок {i} не удалось транскрибировать]\n")
+                
+                # Задержка между кусками
+                if i < len(chunk_files):
+                    logger.info(f"Пауза {self.delay} секунд перед следующим куском...")
+                    time.sleep(self.delay)
+            
+            # Очистка временных файлов
+            self.cleanup_chunks(chunk_files)
+            
+            if successful_chunks == 0:
+                logger.error(f"Ни один кусок файла {file_path} не удалось транскрибировать")
+                return None
+            
+            # Объединяем все транскрипции
+            final_transcription = self.combine_chunk_transcriptions(
+                all_transcriptions, file_path.name, len(chunk_files), successful_chunks
+            )
+            
+            logger.info(f"Файл {file_path.name} полностью обработан: {successful_chunks}/{len(chunk_files)} кусков")
+            return final_transcription
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки файла с кусками {file_path}: {e}")
+            return None
+
+    def transcribe_single_file(self, file_path: Path) -> Optional[str]:
+        """Транскрибирует одиночный файл без разделения"""
+        try:
+            # Загрузка файла
+            audio_file = genai.upload_file(path=str(file_path))
+            
+            # Ожидание обработки файла
+            while audio_file.state.name == "PROCESSING":
+                logger.info("Обработка файла в процессе...")
+                time.sleep(3)
+                audio_file = genai.get_file(audio_file.name)
+            
+            if audio_file.state.name == "FAILED":
+                raise Exception("Не удалось обработать аудио файл")
+            
+            logger.info("Файл успешно загружен в Gemini")
+            
+            # Получение образца голоса
+            has_reference = self.find_and_load_reference_audio()
+            
+            # Полный детальный промпт
+            prompt = f"""
+Пожалуйста, выполни дословную транскрипцию речи на русском из аудиофайла {file_path.name}, следуя приведенным ниже инструкциям:
+
+Вначале пройди по тексту и идентифицируй имена говорящих и затем указывай говорящих в транскрипте, вставляя их имена, которые становятся понятны из контекста разговора.
+
+Основные требования:
+- Распознай и запиши в текстовом виде абсолютно все произнесенные слова, не пропуская, не суммируя и не обобщая содержание
+- Запиши точно все, что было сказано, и только это
+- Каждые 10 минут вставляй summary
+- Выполни полную транскрипцию аудиофайла от начала до конца, не пропуская никаких фрагментов
+- Добавь таймкоды к каждой реплике (каждые 26 токенов - это одна секунда)
+- Продолжай до конца, не повторяйся
+- Если никто ничего не говорит, просто пропускай этот таймкод
+- Если ты дошёл до конца файла в распознавании, то напиши в конце: (конец файла)
+
+Обнаружение зацикливания:
+1. В процессе транскрипции постоянно анализируй текст на предмет дословных повторов
+2. Если последовательность из более чем 15 слов повторяется более 3 раз подряд, считай это техническим сбоем
+3. Транскрибируй повторяющийся фрагмент только один раз
+4. Вместо повторов вставь: [Обнаружен и пропущен многократно повторяющийся фрагмент с {таймкод начала} по {таймкод конца}]
+5. Не считай зацикливанием короткие повторы слов ("нет, нет, нет")
+
+Наиболее вероятные имена участников беседы:
+- Алексей (друг Лизы)
+- Лиза
+- Мура (дочь Лизы)
+
+Пример желаемого формата:
+[00:00:05] (Алексей): Привет, как дела?
+[00:00:08] (Лиза): Привет! У меня все хорошо, спасибо. А у тебя?
+[00:00:12] (Алексей): Да вот, решил тебе позвонить и узнать, как ты справляешься с новым проектом.
+
+Когда файл закончится, сделай выжимку текста в конце - какие самые интересные факты мы узнали."""
+
+            if has_reference:
+                prompt += "\n\nИспользуй прикрепленный образец голоса Алексея Турчина для правильного проставления его имени. Образец в коротком прикреплённом файле."
+            
+            # Подготовка содержимого для зап
