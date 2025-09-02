@@ -16,8 +16,8 @@ on:
         required: false
         default: '3.0'
         type: string
-      force_ffmpeg:
-        description: 'Принудительно использовать FFmpeg для разделения файлов'
+      install_ffmpeg:
+        description: 'Установить FFmpeg для разделения длинных файлов'
         required: false
         default: 'true'
         type: choice
@@ -37,43 +37,58 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         lfs: true
     
-    - name: Install FFmpeg (optional but recommended)
-      if: ${{ github.event.inputs.force_ffmpeg == 'true' }}
+    - name: Install FFmpeg
+      if: ${{ github.event.inputs.install_ffmpeg != 'false' }}
       run: |
         echo "Установка FFmpeg для разделения длинных файлов..."
         sudo apt update
         sudo apt install -y ffmpeg
-        echo "Проверка установки:"
+        echo "Проверка установки FFmpeg:"
         ffmpeg -version | head -n 3
+        echo "Проверка установки FFprobe:"
         ffprobe -version | head -n 3
-        echo "FFmpeg успешно установлен"
+        echo "FFmpeg и FFprobe успешно установлены"
     
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
     
-    - name: Install dependencies
+    - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install google-generativeai pathlib typing
     
     - name: Check system capabilities
       run: |
+        echo "========================================="
         echo "Проверка доступности инструментов:"
-        echo "Python version:"
-        python --version
-        echo "Доступность FFmpeg:"
+        echo "========================================="
+        echo "Python version: $(python --version)"
+        echo ""
+        echo "Проверка FFmpeg:"
         if command -v ffmpeg &> /dev/null; then
-            echo "✓ FFmpeg доступен - длинные файлы будут разделены на куски"
+            echo "✓ FFmpeg доступен - длинные файлы будут разделены на куски по 15 минут"
+            echo "  Версия: $(ffmpeg -version | head -n 1)"
         else
             echo "✗ FFmpeg недоступен - длинные файлы будут обработаны summary-методом"
         fi
+        echo ""
+        echo "Проверка FFprobe:"
         if command -v ffprobe &> /dev/null; then
-            echo "✓ FFprobe доступен - точное определение длительности"
+            echo "✓ FFprobe доступен - точное определение длительности файлов"
+            echo "  Версия: $(ffprobe -version | head -n 1)"
         else
             echo "✗ FFprobe недоступен - оценка длительности по размеру файла"
         fi
+        echo ""
+        echo "Список аудиофайлов для обработки:"
+        if [ -d "audio_files" ]; then
+            find audio_files -type f \( -name "*.mp3" -o -name "*.wav" -o -name "*.m4a" -o -name "*.flac" -o -name "*.ogg" -o -name "*.webm" -o -name "*.aac" \) | head -10
+        else
+            echo "Папка audio_files не найдена"
+        fi
+        echo "========================================="
     
     - name: Run transcription
       env:
