@@ -1,4 +1,4 @@
-name: Audio Transcription with Gemini 2.5 Pro
+name: Audio Transcription with Adaptive Processing
 
 on:
   workflow_dispatch:
@@ -14,13 +14,21 @@ on:
       api_delay:
         description: 'Задержка между запросами (секунды)'
         required: false
-        default: '4.0'
+        default: '3.0'
         type: string
+      force_ffmpeg:
+        description: 'Принудительно использовать FFmpeg для разделения файлов'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
 
 jobs:
   transcribe:
     runs-on: ubuntu-latest
-    timeout-minutes: 600  # 10 часов
+    timeout-minutes: 720  # 12 часов
     
     steps:
     - name: Checkout repository
@@ -28,6 +36,17 @@ jobs:
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         lfs: true
+    
+    - name: Install FFmpeg (optional but recommended)
+      if: ${{ github.event.inputs.force_ffmpeg == 'true' }}
+      run: |
+        echo "Установка FFmpeg для разделения длинных файлов..."
+        sudo apt update
+        sudo apt install -y ffmpeg
+        echo "Проверка установки:"
+        ffmpeg -version | head -n 3
+        ffprobe -version | head -n 3
+        echo "FFmpeg успешно установлен"
     
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -39,20 +58,87 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
+    - name: Check system capabilities
+      run: |
+        echo "Проверка доступности инструментов:"
+        echo "Python version:"
+        python --version
+        echo "Доступность FFmpeg:"
+        if command -v ffmpeg &> /dev/null; then
+            echo "✓ FFmpeg доступен - длинные файлы будут разделены на куски"
+        else
+            echo "✗ FFmpeg недоступен - длинные файлы будут обработаны summary-методом"
+        fi
+        if command -v ffprobe &> /dev/null; then
+            echo "✓ FFprobe доступен - точное определение длительности"
+        else
+            echo "✗ FFprobe недоступен - оценка длительности по размеру файла"
+        fi
+    
     - name: Run transcription
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         SOURCE_DIR: 'audio_files'
         OUTPUT_DIR: 'transcriptions'
-        API_DELAY: ${{ github.event.inputs.api_delay || '4.0' }}
+        API_DELAY: ${{ github.event.inputs.api_delay || '3.0' }}
         USE_REFERENCE_AUDIO: ${{ github.event.inputs.use_reference_audio || 'true' }}
       run: |
+        echo "Запуск транскрипции с адаптивной обработкой..."
         python transcribe.py
+    
+    - name: Check results
+      run: |
+        echo "Результаты обработки:"
+        if [ -d "transcriptions" ]; then
+            echo "Найдены транскрипции:"
+            find transcriptions -name "*.txt" -type f | head -10
+            echo "Общее количество файлов транскрипций: $(find transcriptions -name "*_transcription.txt" | wc -l)"
+            
+            if [ -f "transcriptions/all_transcriptions.txt" ]; then
+                echo "✓ Создан сводный файл транскрипций"
+                echo "Размер сводного файла: $(du -h transcriptions/all_transcriptions.txt | cut -f1)"
+            fi
+            
+            if [ -f "transcriptions/failed_files.json" ]; then
+                echo "⚠ Обнаружены ошибки обработки:"
+                cat transcriptions/failed_files.json
+            fi
+            
+            if [ -f "transcription.log" ]; then
+                echo "Последние строки лога:"
+                tail -20 transcription.log
+            fi
+        else
+            echo "❌ Папка transcriptions не создана"
+        fi
     
     - name: Commit and push results
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add transcriptions/ audio_files/
-        git diff --staged --quiet || git commit -m "Add transcriptions (Gemini 2.5 Pro) - fixed MAX_TOKENS issue"
-        git push
+        
+        # Добавляем все изменения
+        git add transcriptions/ audio_files/ transcription.log
+        
+        # Проверяем есть ли изменения для коммита
+        if git diff --staged --quiet; then
+            echo "Нет изменений для коммита"
+        else
+            # Создаем информативное сообщение коммита
+            TRANSCRIBED_COUNT=$(find transcriptions -name "*_transcription.txt" 2>/dev/null | wc -l)
+            FFMPEG_STATUS="without FFmpeg"
+            if command -v ffmpeg &> /dev/null; then
+                FFMPEG_STATUS="with FFmpeg"
+            fi
+            
+            git commit -m "Add transcriptions: ${TRANSCRIBED_COUNT} files processed ${FFMPEG_STATUS}
+            
+            - Processed with Gemini 2.5 Pro
+            - Adaptive processing strategy
+            - Generated on $(date)
+            
+            Details in transcription.log"
+            
+            git push
+            echo "✓ Результаты успешно сохранены"
+        fi
